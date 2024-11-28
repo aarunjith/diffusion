@@ -8,6 +8,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torch.cuda.amp import GradScaler
+import torchvision
+import math
+import numpy as np
+import matplotlib.pyplot as plt
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -20,17 +26,27 @@ else:
 class SimpleDataset(Dataset):
     def __init__(self, images, transform=None):
         self.images = images
-        self.transform = transform
+        self.transform = transform or transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(
+                    brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1
+                ),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            ]
+        )
+        self.transform = None
 
     def __getitem__(self, index):
         image = self.images[index]
         image = Image.open(image)
         image = image.convert("RGB")
-        image = image.resize((64, 64))
-        image = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1)
-        image = image / 127.5 - 1
+        image = image.resize((128, 128))
+
+        image = transforms.ToTensor()(image)
         if self.transform:
             image = self.transform(image)
+        image = 2 * image - 1
         return image
 
     def __len__(self):
@@ -97,7 +113,7 @@ class SimpleDiffusionModel:
 
         return noisy_image.to(device), noise.to(device)
 
-    def create_simple_unet(self, in_channels=3, out_channels=3):
+    def create_simple_unet(self, in_channels=3, out_channels=3, timesteps=1000):
         """
         Create a simple U-Net for noise prediction
 
@@ -110,71 +126,121 @@ class SimpleDiffusionModel:
         """
 
         class SimpleUNet(nn.Module):
-            def __init__(self, in_channels, out_channels):
+            def __init__(self, in_channels, out_channels, timesteps):
                 super().__init__()
+
+                # Time embedding
+                self.time_dim = 128 * 128
+
+                def getPositionEncoding(seq_len, d, n=10000):
+                    P = np.zeros((seq_len, d))
+                    for k in range(seq_len):
+                        for i in np.arange(int(d / 2)):
+                            denominator = np.power(n, 2 * i / d)
+                            P[k, 2 * i] = np.sin(k / denominator)
+                            P[k, 2 * i + 1] = np.cos(k / denominator)
+                    return P
+
+                # Pre-compute the timestep embeddings
+                self.register_buffer(
+                    "timestep_embeddings",
+                    torch.tensor(
+                        getPositionEncoding(timesteps, self.time_dim),
+                        dtype=torch.float32,
+                    ),
+                )
 
                 # Encoder
                 self.enc1 = nn.Sequential(
                     nn.Conv2d(in_channels + 1, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.BatchNorm2d(64),
+                    nn.GroupNorm(8, 64),  # Changed from BatchNorm
+                    nn.GELU(),  # Changed from ReLU
                     nn.Conv2d(64, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.BatchNorm2d(64),
+                    nn.GroupNorm(8, 64),
+                    nn.GELU(),
                 )
-                self.pool1 = nn.MaxPool2d(2)
 
                 self.enc2 = nn.Sequential(
                     nn.Conv2d(64, 128, 3, padding=1),
-                    nn.ReLU(),
-                    nn.BatchNorm2d(128),
+                    nn.GroupNorm(8, 128),
+                    nn.GELU(),
                     nn.Conv2d(128, 128, 3, padding=1),
-                    nn.ReLU(),
-                    nn.BatchNorm2d(128),
+                    nn.GroupNorm(8, 128),
+                    nn.GELU(),
                 )
-                self.pool2 = nn.MaxPool2d(2)
+
+                self.enc3 = nn.Sequential(
+                    nn.Conv2d(128, 256, 3, padding=1),
+                    nn.GroupNorm(8, 256),
+                    nn.GELU(),
+                    nn.Conv2d(256, 256, 3, padding=1),
+                    nn.GroupNorm(8, 256),
+                    nn.GELU(),
+                )
 
                 # Bridge
                 self.bridge = nn.Sequential(
-                    nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(), nn.BatchNorm2d(256)
+                    nn.Conv2d(256, 512, 3, padding=1),
+                    nn.GroupNorm(8, 512),
+                    nn.GELU(),
+                    nn.Conv2d(512, 512, 3, padding=1),
+                    nn.GroupNorm(8, 512),
+                    nn.GELU(),
                 )
 
                 # Decoder
-                self.up1 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-                self.dec1 = nn.Sequential(
-                    nn.Conv2d(256, 128, 3, padding=1),  # 256 because of skip connection
-                    nn.ReLU(),
-                    nn.BatchNorm2d(128),
+                self.dec3 = nn.Sequential(
+                    nn.Conv2d(512 + 256, 256, 3, padding=1),
+                    nn.GroupNorm(8, 256),
+                    nn.GELU(),
+                    nn.Conv2d(256, 256, 3, padding=1),
+                    nn.GroupNorm(8, 256),
+                    nn.GELU(),
                 )
 
-                self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
                 self.dec2 = nn.Sequential(
-                    nn.Conv2d(128, 64, 3, padding=1),  # 128 because of skip connection
-                    nn.ReLU(),
-                    nn.BatchNorm2d(64),
+                    nn.Conv2d(256 + 128, 128, 3, padding=1),
+                    nn.GroupNorm(8, 128),
+                    nn.GELU(),
+                    nn.Conv2d(128, 128, 3, padding=1),
+                    nn.GroupNorm(8, 128),
+                    nn.GELU(),
+                )
+
+                self.dec1 = nn.Sequential(
+                    nn.Conv2d(128 + 64, 64, 3, padding=1),
+                    nn.GroupNorm(8, 64),
+                    nn.GELU(),
                     nn.Conv2d(64, out_channels, 3, padding=1),
+                )
+
+                self.pool = nn.MaxPool2d(2)
+                self.upsample = nn.Upsample(
+                    scale_factor=2, mode="bilinear", align_corners=True
                 )
 
             def forward(self, x, t):
                 # Time embedding
-                t_emb = torch.sin(t.float() / 100)
-                t_emb = t_emb.view(-1, 1, 1, 1).repeat(1, 1, x.shape[2], x.shape[3])
-                x = torch.cat([x, t_emb], dim=1)
+                # x shape : B,3,128,128
+                t_emb = self.timestep_embeddings[t]  # 1x128x128
+                x = torch.cat([x, t_emb.view(-1, 1, 128, 128)], dim=1)
 
                 # Encoder
                 e1 = self.enc1(x)
-                e2 = self.enc2(self.pool1(e1))
+                e2 = self.enc2(self.pool(e1))
+                e3 = self.enc3(self.pool(e2))
 
                 # Bridge
-                b = self.bridge(self.pool2(e2))
+                b = self.bridge(self.pool(e3))
 
                 # Decoder with skip connections
-                d1 = self.dec1(torch.cat([self.up1(b), e2], dim=1))
-                d2 = self.dec2(torch.cat([self.up2(d1), e1], dim=1))
+                d3 = self.dec3(torch.cat([self.upsample(b), e3], dim=1))
+                d2 = self.dec2(torch.cat([self.upsample(d3), e2], dim=1))
+                d1 = self.dec1(torch.cat([self.upsample(d2), e1], dim=1))
 
-                return d2
+                return d1
 
-        return SimpleUNet(in_channels, out_channels).to(device)
+        return SimpleUNet(in_channels, out_channels, timesteps).to(device)
 
     def sample(self, model, shape, device="cpu"):
         """
@@ -216,54 +282,74 @@ class SimpleDiffusionModel:
 
         return img.clamp(-1, 1)
 
-    def train(self, model, dataloader, epochs=100, lr=2e-4):
-        optimizer = optim.Adam(model.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    def train(self, model, dataloader, epochs=100, lr=1e-3):
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            epochs=epochs,
+            steps_per_epoch=len(dataloader),
+            pct_start=0.1,
+        )
         criterion = nn.MSELoss()
+        scaler = GradScaler()
 
-        for epoch in tqdm(range(epochs)):
+        best_loss = float("inf")
+
+        for epoch in range(epochs):
             model.train()
-            total_loss = 0
-            for batch in dataloader:
-                optimizer.zero_grad()
-                batch = batch.to(device)
+            total_loss = []
 
-                # Sample random timesteps
-                t = torch.randint(0, self.timesteps, (batch.shape[0],)).to(device)
+            with tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}") as pbar:
+                for batch in pbar:
+                    optimizer.zero_grad()
+                    batch = batch.to(device)
 
-                # Add noise to the batch
-                noisy_batch, noise = self.forward_diffusion(batch, t)
+                    # Sample random timesteps
+                    t = torch.randint(0, self.timesteps, (batch.shape[0],)).to(device)
 
-                # Predict noise
-                noise_pred = model(noisy_batch, t)
+                    # Add noise to the batch
+                    noisy_batch, noise = self.forward_diffusion(batch, t)
 
-                # Compute loss
-                loss = criterion(noise_pred, noise)
-                loss.backward()
+                    # Use mixed precision training
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        noise_pred = model(noisy_batch, t)
+                        loss = criterion(noise_pred, noise)
 
-                # Clip gradients for stability
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                optimizer.step()
-                total_loss += loss.item()
+                    scheduler.step()
 
-            scheduler.step()
-            avg_loss = total_loss / len(dataloader)
-            print(
-                f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}"
-            )
-            if (epoch) % 10 == 0:
-                os.makedirs("samples", exist_ok=True)
-                sample = self.sample(model, (1, 3, 64, 64), device=device)
-                print(f"Saving sample {epoch+1}")
-                plt.imsave(
-                    f"samples/sample_{epoch+1}.png",
-                    ((sample[0] + 1) * 127.5 / 255)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .transpose(1, 2, 0),
+                    total_loss.append(loss.item())
+                    pbar.set_postfix(
+                        {
+                            f"Epoch {epoch+1}/{epochs}, Average Loss: {np.mean(total_loss):.6f}"
+                            " lr": scheduler.get_last_lr()[0],
+                        }
+                    )
+
+            avg_loss = np.mean(total_loss)
+            # Save best model
+            if avg_loss < best_loss:
+                print(
+                    f"Saving best model with loss: {avg_loss:.6f}, best loss before: {best_loss:.6f}"
                 )
+                best_loss = avg_loss
+                self.save(model, "best_model.pth")
+
+            # Generate samples every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                os.makedirs("samples", exist_ok=True)
+                model.eval()
+                with torch.no_grad():
+                    samples = self.sample(model, (4, 3, 128, 128), device=device)
+                    # Create a grid of images
+                    grid = torchvision.utils.make_grid(samples, nrow=2, normalize=True)
+                    torchvision.utils.save_image(grid, f"samples/epoch_{epoch+1}.png")
 
     def save(self, model, path):
         """
@@ -299,22 +385,22 @@ def main():
 
     # This will be filled in with actual data loading and training code
     timesteps = 1000
-    beta_start = 0.0001
+    beta_start = 1e-4
     beta_end = 0.02
 
     model = SimpleDiffusionModel(timesteps, beta_start, beta_end)
     unet = model.create_simple_unet(
-        in_channels=3, out_channels=3
+        in_channels=3, out_channels=3, timesteps=timesteps
     )  # Specify channels explicitly
     print(f"Model Parameters: {sum(p.numel() for p in unet.parameters())}")
     try:
         model.load(unet, "model.pth")
     except:
         print("Training model from scratch")
-    model.train(unet, train_loader, epochs=100, lr=1e-3)
+    model.train(unet, train_loader, epochs=1, lr=1e-4)
     model.save(unet, "model.pth")
 
-    sample = model.sample(unet, (1, 3, 64, 64), device=device)
+    sample = model.sample(unet, (1, 3, 128, 128), device=device)
     plt.imshow(sample[0].detach().cpu().numpy().transpose(1, 2, 0))
     plt.show()
 
